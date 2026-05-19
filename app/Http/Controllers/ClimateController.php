@@ -12,17 +12,9 @@ class ClimateController extends Controller
     private const NASA_API_URL = 'https://power.larc.nasa.gov/api/temporal/daily/point';
 
     private const DEFAULT_SITE = [
-        'name' => 'Riohacha, La Guajira',
+        'name' => 'Riohacha, Colombia',
         'latitude' => 11.5444,
         'longitude' => -72.9069,
-        'pv_capacity_kwp' => 20.0,
-        'battery_capacity_kwh' => 40.0,
-        'critical_load_kw' => 5.5,
-        'daily_load_kwh' => 58.0,
-        'tariff_cop_kwh' => 943,
-        'performance_ratio' => 0.78,
-        'self_consumption_ratio' => 0.82,
-        'co2_factor_kg_kwh' => 0.42,
     ];
 
     public function index(): View
@@ -67,7 +59,7 @@ class ClimateController extends Controller
             }
 
             $raw = $response->json();
-            $processed = $this->processDailyData($raw, $site);
+            $processed = $this->processDailyData($raw);
 
             if (empty($processed)) {
                 return response()->json([
@@ -77,15 +69,15 @@ class ClimateController extends Controller
                 ], 502);
             }
 
-            $statistics = $this->buildStatistics($processed, $site);
+            $statistics = $this->buildStatistics($processed);
 
             return response()->json([
                 'success' => true,
                 'site' => $site,
                 'data' => $processed,
                 'statistics' => $statistics,
-                'recommendations' => $this->buildRecommendations($statistics, $site),
-                'alerts' => $this->buildAlerts($statistics, $site),
+                'recommendations' => $this->buildRecommendations($statistics),
+                'alerts' => $this->buildAlerts($statistics),
                 'meta' => [
                     'latitude' => $site['latitude'],
                     'longitude' => $site['longitude'],
@@ -124,7 +116,7 @@ class ClimateController extends Controller
         return $site;
     }
 
-    private function processDailyData(array $data, array $site): array
+    private function processDailyData(array $data): array
     {
         if (!isset($data['properties']['parameter']) || !is_array($data['properties']['parameter'])) {
             return [];
@@ -150,17 +142,9 @@ class ClimateController extends Controller
                 continue;
             }
 
-            $generation = $radiation !== null
-                ? round($radiation * $site['pv_capacity_kwp'] * $site['performance_ratio'], 1)
-                : 0.0;
-
-            $demand = round(
-                $site['daily_load_kwh'] * (1 + max(0, (($temperature ?? 0) - 30) * 0.01)),
-                1
-            );
-
-            $savings = round(min($generation, $demand) * $site['tariff_cop_kwh'] * $site['self_consumption_ratio'], 0);
-            $co2Avoided = round($generation * $site['co2_factor_kg_kwh'], 1);
+            $solarRatio = ($radiation !== null && $clearSky !== null && $clearSky > 0)
+                ? round(($radiation / $clearSky) * 100, 1)
+                : null;
 
             $processed[] = [
                 'date' => $this->formatDate($date),
@@ -169,166 +153,177 @@ class ClimateController extends Controller
                 'temperature' => $temperature,
                 'humidity' => $humidity,
                 'wind_speed' => $wind,
-                'estimated_generation_kwh' => $generation,
-                'estimated_demand_kwh' => $demand,
-                'estimated_savings_cop' => $savings,
-                'co2_avoided_kg' => $co2Avoided,
+                'solar_ratio' => $solarRatio,
             ];
         }
 
         return $processed;
     }
 
-    private function buildStatistics(array $data, array $site): array
+    private function buildStatistics(array $data): array
     {
         $radiations = $this->validNumbers(array_column($data, 'radiation'));
+        $clearSky = $this->validNumbers(array_column($data, 'clear_sky_radiation'));
         $temperatures = $this->validNumbers(array_column($data, 'temperature'));
         $humidities = $this->validNumbers(array_column($data, 'humidity'));
-        $generations = $this->validNumbers(array_column($data, 'estimated_generation_kwh'));
-        $savings = $this->validNumbers(array_column($data, 'estimated_savings_cop'));
-        $co2 = $this->validNumbers(array_column($data, 'co2_avoided_kg'));
+        $windSpeeds = $this->validNumbers(array_column($data, 'wind_speed'));
+        $ratios = $this->validNumbers(array_column($data, 'solar_ratio'));
 
-        $peakDay = $this->peakDay($data, 'estimated_generation_kwh');
         $latest = end($data) ?: null;
-        $averageGeneration = !empty($generations) ? array_sum($generations) / count($generations) : 0;
-
-        $coverage = $site['daily_load_kwh'] > 0
-            ? round(($averageGeneration / $site['daily_load_kwh']) * 100, 1)
-            : 0;
-
-        $batteryCharge = (int) max(18, min(100, 42 + ($coverage * 0.45)));
-        $solarWindow = $this->solarWindowFromAverage(!empty($radiations) ? array_sum($radiations) / count($radiations) : 0);
-        $solarScore = $this->solarScore($radiations, $coverage);
+        $peakDay = $this->peakDay($data, 'radiation');
+        $lowDay = $this->lowDay($data, 'radiation');
+        $stabilityIndex = $this->stabilityIndex($radiations);
 
         return [
-            'avg_radiation' => !empty($radiations) ? round(array_sum($radiations) / count($radiations), 2) : 0,
+            'avg_radiation' => $this->average($radiations),
             'max_radiation' => !empty($radiations) ? max($radiations) : 0,
             'min_radiation' => !empty($radiations) ? min($radiations) : 0,
-            'avg_temperature' => !empty($temperatures) ? round(array_sum($temperatures) / count($temperatures), 1) : 0,
-            'avg_humidity' => !empty($humidities) ? round(array_sum($humidities) / count($humidities), 1) : 0,
-            'total_generation_kwh' => round(array_sum($generations), 1),
-            'estimated_monthly_savings_cop' => round(array_sum($savings), 0),
-            'co2_avoided_kg' => round(array_sum($co2), 1),
-            'coverage_ratio' => $coverage,
-            'battery_autonomy_hours' => round($site['battery_capacity_kwh'] / max(0.1, $site['critical_load_kw']), 1),
-            'battery_charge_percent' => $batteryCharge,
-            'battery_usage_text' => $coverage >= 85 ? 'Excedente para carga' : ($coverage >= 60 ? 'Carga balanceada' : 'Priorizar respaldo'),
-            'solar_window' => $solarWindow,
-            'solar_score' => $solarScore,
-            'peak_day' => $peakDay['date'] ?? '--',
-            'peak_day_generation_kwh' => $peakDay['value'] ?? 0,
-            'latest_radiation' => $latest['radiation'] ?? 0,
-            'latest_generation_kwh' => $latest['estimated_generation_kwh'] ?? 0,
-            'latest_savings_cop' => $latest['estimated_savings_cop'] ?? 0,
+            'avg_clear_sky' => $this->average($clearSky),
+            'avg_temperature' => $this->average($temperatures, 1),
+            'avg_humidity' => $this->average($humidities, 1),
+            'avg_wind_speed' => $this->average($windSpeeds, 2),
+            'avg_solar_ratio' => $this->average($ratios, 1),
+            'stability_index' => $stabilityIndex,
             'latest_date' => $latest['date'] ?? '--',
+            'latest_radiation' => $latest['radiation'] ?? 0,
+            'latest_temperature' => $latest['temperature'] ?? 0,
+            'latest_humidity' => $latest['humidity'] ?? 0,
+            'latest_wind_speed' => $latest['wind_speed'] ?? 0,
+            'peak_day' => $peakDay['date'] ?? '--',
+            'peak_day_radiation' => $peakDay['value'] ?? 0,
+            'low_day' => $lowDay['date'] ?? '--',
+            'low_day_radiation' => $lowDay['value'] ?? 0,
+            'solar_score' => $this->solarScore($radiations, $ratios),
             'tags' => [
-                $solarScore >= 80 ? 'Alta oportunidad solar' : 'Estrategia solar en ajuste',
-                $coverage >= 80 ? 'Cobertura FV alta' : 'Cobertura FV moderada',
-                $batteryCharge >= 70 ? 'Batería saludable' : 'Refuerzo de almacenamiento',
+                !empty($radiations) && $this->average($radiations) >= 6.5 ? 'Alta radiación' : 'Radiación variable',
+                $stabilityIndex >= 75 ? 'Patrón estable' : 'Patrón cambiante',
+                !empty($ratios) && $this->average($ratios) >= 80 ? 'Cielo favorable' : 'Cobertura mixta',
             ],
         ];
     }
 
-    private function buildRecommendations(array $stats, array $site): array
+    private function buildRecommendations(array $stats): array
     {
         $items = [];
 
         $items[] = [
-            'icon' => 'fa-clock',
-            'title' => 'Mover cargas a la franja solar',
-            'message' => 'Programa refrigeración, bombeo y procesos intensivos entre ' . $stats['solar_window'] . ' para aprovechar la radiación disponible.',
+            'icon' => 'fa-sun',
+            'title' => 'Aprovechar la ventana de mayor radiación',
+            'message' => 'La franja con mejores condiciones solares debe priorizar cargas intensivas y procesos que dependan de energía estable.',
         ];
 
-        if ($stats['coverage_ratio'] < 75) {
+        if ($stats['avg_radiation'] < 5.5) {
             $items[] = [
-                'icon' => 'fa-battery-three-quarters',
-                'title' => 'Aumentar respaldo',
-                'message' => 'La cobertura fotovoltaica aún es moderada. Conviene priorizar baterías o gestión de cargas en horas de baja radiación.',
+                'icon' => 'fa-cloud-sun',
+                'title' => 'Vigilar días de radiación baja',
+                'message' => 'Conviene postergar consumos no críticos cuando la radiación promedio cae por debajo del umbral esperado.',
             ];
         } else {
             $items[] = [
                 'icon' => 'fa-bolt',
-                'title' => 'Aprovechar excedentes',
-                'message' => 'Hay suficiente margen solar para cargar baterías y desplazar consumos no críticos al mediodía.',
+                'title' => 'Optimizar autoconsumo',
+                'message' => 'El comportamiento reciente sugiere una buena oportunidad para absorber más energía solar en sitio.',
             ];
         }
 
         if ($stats['avg_temperature'] >= 32) {
             $items[] = [
-                'icon' => 'fa-fan',
-                'title' => 'Ajustar climatización',
-                'message' => 'El calor incrementa la demanda. Ajusta aire acondicionado y ventilación para evitar picos de consumo.',
+                'icon' => 'fa-temperature-three-quarters',
+                'title' => 'Prever mayor carga térmica',
+                'message' => 'Las temperaturas elevadas pueden aumentar la demanda de refrigeración y afectar la eficiencia del sistema.',
             ];
         }
 
         $items[] = [
-            'icon' => 'fa-shield-heart',
-            'title' => 'Mantener reserva operativa',
-            'message' => 'Reserva al menos una fracción de la batería para interrupciones de red y eventos de alta demanda.',
+            'icon' => 'fa-chart-line',
+            'title' => 'Monitorear estabilidad',
+            'message' => 'La consistencia entre radiación real y cielo despejado ayuda a detectar días con nubosidad o pérdidas por suciedad.',
         ];
 
         return $items;
     }
 
-    private function buildAlerts(array $stats, array $site): array
+    private function buildAlerts(array $stats): array
     {
         $alerts = [];
 
         if ($stats['avg_radiation'] < 5.5) {
             $alerts[] = [
                 'level' => 'warning',
-                'title' => 'Radiación por debajo del potencial esperado',
-                'message' => 'La media reciente está por debajo de Riohacha. Revisa nubosidad, mantenimiento o suciedad en paneles.',
+                'title' => 'Radiación inferior a la referencia reciente',
+                'message' => 'Revisa nubosidad, polvo en paneles o cambios en la condición atmosférica.',
             ];
         } else {
             $alerts[] = [
                 'level' => 'success',
-                'title' => 'Condición solar favorable',
-                'message' => 'La radiación promedio está alineada con el potencial de la ciudad y permite optimizar consumo diurno.',
+                'title' => 'Radiación favorable',
+                'message' => 'Las mediciones recientes muestran un comportamiento solar saludable para la operación fotovoltaica.',
             ];
         }
 
-        if ($stats['coverage_ratio'] < 70) {
+        if ($stats['stability_index'] < 65) {
             $alerts[] = [
                 'level' => 'critical',
-                'title' => 'Cobertura fotovoltaica limitada',
-                'message' => 'El sistema no cubre toda la demanda base. Considera desplazar cargas, ampliar paneles o aumentar batería.',
+                'title' => 'Variabilidad alta',
+                'message' => 'El patrón diario cambió bastante en el periodo analizado. Conviene ajustar planificación operativa.',
             ];
         }
 
-        if ($stats['battery_charge_percent'] < 50) {
+        if ($stats['avg_solar_ratio'] > 0 && $stats['avg_solar_ratio'] < 75) {
             $alerts[] = [
                 'level' => 'warning',
-                'title' => 'Batería en nivel medio',
-                'message' => 'Conviene reservar energía para continuidad operativa en caso de interrupciones de red.',
+                'title' => 'Cobertura solar moderada',
+                'message' => 'La radiación real está por debajo del cielo despejado en buena parte del periodo.',
             ];
         }
 
         return $alerts;
     }
 
-    private function solarWindowFromAverage(float $avgRadiation): string
+    private function average(array $values, int $precision = 2): float
     {
-        if ($avgRadiation >= 6.5) {
-            return '10:00 - 14:00';
+        if (empty($values)) {
+            return 0;
         }
 
-        if ($avgRadiation >= 5.0) {
-            return '10:30 - 13:30';
-        }
-
-        return '11:00 - 13:00';
+        return round(array_sum($values) / count($values), $precision);
     }
 
-    private function solarScore(array $radiations, float $coverage): int
+    private function stabilityIndex(array $values): int
+    {
+        if (count($values) < 2) {
+            return 100;
+        }
+
+        $avg = array_sum($values) / count($values);
+
+        if ($avg == 0.0) {
+            return 100;
+        }
+
+        $variance = 0.0;
+
+        foreach ($values as $value) {
+            $variance += ($value - $avg) ** 2;
+        }
+
+        $stdDev = sqrt($variance / count($values));
+        $index = 100 - min(100, ($stdDev / max($avg, 0.1)) * 120);
+
+        return (int) max(0, round($index));
+    }
+
+    private function solarScore(array $radiations, array $ratios): int
     {
         $radiationScore = !empty($radiations)
-            ? min(60, (array_sum($radiations) / count($radiations)) * 8)
+            ? min(60, ($this->average($radiations) / 7.0) * 60)
             : 0;
 
-        $coverageScore = min(40, max(0, $coverage * 0.4));
+        $ratioScore = !empty($ratios)
+            ? min(40, ($this->average($ratios, 1) / 100) * 40)
+            : 0;
 
-        return (int) min(100, round($radiationScore + $coverageScore));
+        return (int) min(100, round($radiationScore + $ratioScore));
     }
 
     private function peakDay(array $data, string $field): array
@@ -347,6 +342,24 @@ class ClimateController extends Controller
         }
 
         return $best;
+    }
+
+    private function lowDay(array $data, string $field): array
+    {
+        $lowest = ['date' => '--', 'value' => PHP_FLOAT_MAX];
+
+        foreach ($data as $row) {
+            $value = (float) ($row[$field] ?? 0);
+
+            if ($value <= $lowest['value']) {
+                $lowest = [
+                    'date' => $row['date'] ?? '--',
+                    'value' => round($value, 1),
+                ];
+            }
+        }
+
+        return $lowest['value'] === PHP_FLOAT_MAX ? ['date' => '--', 'value' => 0] : $lowest;
     }
 
     private function formatDate(string $dateString): string
